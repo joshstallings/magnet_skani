@@ -11,6 +11,7 @@ setup(
         "ete3",
         "scikit-learn",
         "numpy",
+        "pyskani>=0.2.0",
     ],
     entry_points={
         "console_scripts": [

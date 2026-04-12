@@ -1,6 +1,7 @@
 import os
 import argparse
 import pathlib
+import shutil
 import sys
 import subprocess
 import math
@@ -21,6 +22,7 @@ from utils.ani import ani_summary
 from utils.input_parsing import parsing_input_f, filter_input_df, get_seq2assembly_dict
 
 import numpy as np
+import pyskani
 from sklearn.cluster import AgglomerativeClustering
 from ast import literal_eval
     
@@ -46,32 +48,135 @@ def samtools_calculate_coverage(output_dir, include_supp=False):
                     check=True,
                     stdout=open(coverage_file, "w"))
     
-def parse_fastani_line(line):
-    ret_list = []
-    for item in line.strip().split('\t')[1:]:
-        if item == 'NA':
-            ret_list.append(float(0))
-        else:
-            ret_list.append(float(item))
-    return ret_list
+def _parse_skani_triangle_matrix_file(matrix_path, assemblies):
+    """Read skani ``triangle`` Phylip-style full matrix; reorder rows/cols to ``assemblies``."""
+    with open(matrix_path) as f:
+        lines = f.readlines()
+    n = int(lines[0].strip())
+    names_order = []
+    rows = []
+    for line in lines[1:]:
+        parts = line.rstrip('\n').split('\t')
+        path_or_name = parts[0]
+        acc = os.path.splitext(os.path.basename(path_or_name))[0]
+        vals = [float(x) for x in parts[1:]]
+        if len(vals) != n:
+            raise ValueError(
+                f'Unexpected skani matrix row width: expected {n}, got {len(vals)}'
+            )
+        names_order.append(acc)
+        rows.append(vals)
+    mat = np.array(rows, dtype=np.float64)
+    pos = {acc: i for i, acc in enumerate(names_order)}
+    missing = set(assemblies) - set(pos.keys())
+    if missing:
+        raise ValueError(
+            f'Skani matrix missing assemblies (check FASTA paths): {missing}'
+        )
+    idx = [pos[acc] for acc in assemblies]
+    return mat[np.ix_(idx, idx)]
 
-def find_representative_genome(fastani_path, fastani_assemblies, downloaded_assemblies):
-    fastani_result = os.path.join(fastani_path, f'pairwise_ani.matrix')
-    #fastani_assemblies = downloaded_assemblies[downloaded_assemblies['Genus Taxid'] == genus_taxid]['Assembly Accession ID'].values
-    
 
-    ani_matrix = []
-    with open(fastani_result, 'r') as fastani_out_f:
-        lines = fastani_out_f.readlines()
-        num_seqs = int(lines[0].strip())
-        
-        for idx, line in enumerate(lines[1:]):
-            ani_matrix.append(parse_fastani_line(line)+list(np.ones(num_seqs-idx)*100))
+def compute_skani_pairwise_matrix_cli_mag(
+    reference_genome_path, assemblies, skani_workdir, threads
+):
+    """
+    MAG mode: run ``skani triangle --full-matrix --min-af 0`` (pyskani cannot set min AF).
+    Requires the ``skani`` executable on PATH (e.g. conda install -c bioconda skani).
+    """
+    skani_bin = shutil.which('skani')
+    if not skani_bin:
+        raise RuntimeError(
+            'MAG mode (--include-mag) requires the `skani` executable on PATH so '
+            'pairwise ANI can use `--min-af 0`. Install e.g. `conda install -c bioconda skani`.'
+        )
+    n = len(assemblies)
+    if n == 0:
+        return np.zeros((0, 0), dtype=np.float64)
 
-    dist_nparray = 1-np.array(ani_matrix)/100
+    fasta_paths = [
+        os.path.abspath(os.path.join(reference_genome_path, f'{acc}.fasta'))
+        for acc in assemblies
+    ]
+    out_base = os.path.join(skani_workdir, 'pairwise_ani')
+    cmd = [
+        skani_bin,
+        'triangle',
+        '--full-matrix',
+        '--min-af',
+        '0',
+        '-t',
+        str(threads),
+        '-o',
+        out_base,
+    ] + fasta_paths
+    stdout_path = os.path.join(skani_workdir, 'skani_cli.stdout')
+    stderr_path = os.path.join(skani_workdir, 'skani_cli.stderr')
+    with open(stdout_path, 'w') as out, open(stderr_path, 'w') as err:
+        subprocess.run(cmd, check=True, stdout=out, stderr=err)
+    matrix_path = out_base
+    if not os.path.isfile(matrix_path):
+        raise FileNotFoundError(
+            f'Expected skani ANI matrix at {matrix_path}; check skani_cli.stderr in {skani_workdir}'
+        )
+    return _parse_skani_triangle_matrix_file(matrix_path, assemblies)
+
+
+def compute_skani_pairwise_matrix_pyskani(reference_genome_path, assemblies):
+    """Build symmetric ANI matrix on a 0–100 scale using skani via pyskani (in-process)."""
+    n = len(assemblies)
+    if n == 0:
+        return np.zeros((0, 0), dtype=np.float64)
+
+    contigs_by_acc = {}
+    database = pyskani.Database()
+    for acc in assemblies:
+        fasta_path = os.path.join(reference_genome_path, f'{acc}.fasta')
+        contigs = tuple(bytes(r.seq) for r in SeqIO.parse(fasta_path, 'fasta'))
+        contigs_by_acc[acc] = contigs
+        database.sketch(acc, *contigs)
+
+    acc_to_idx = {a: i for i, a in enumerate(assemblies)}
+    directional = np.zeros((n, n), dtype=np.float64)
+    np.fill_diagonal(directional, 100.0)
+
+    for i, acc in enumerate(assemblies):
+        hits = database.query(acc, *contigs_by_acc[acc])
+        for hit in hits:
+            j = acc_to_idx.get(hit.reference_name)
+            if j is None or i == j:
+                continue
+            directional[i, j] = hit.identity
+
+    if n > 1:
+        mask = ~np.eye(n, dtype=bool)
+        mx = directional[mask].max()
+        if mx > 0 and mx <= 1.0:
+            directional[mask] *= 100.0
+
+    ani_sym = (directional + directional.T) / 2.0
+    np.fill_diagonal(ani_sym, 100.0)
+    return ani_sym
+
+
+def compute_skani_pairwise_matrix(
+    reference_genome_path, assemblies, mag_mode=False, threads=1, skani_workdir=None
+):
+    """
+    Pairwise ANI on a 0–100 scale. MAG mode uses ``skani triangle --min-af 0``; otherwise pyskani.
+    """
+    if mag_mode:
+        return compute_skani_pairwise_matrix_cli_mag(
+            reference_genome_path, assemblies, skani_workdir, threads
+        )
+    return compute_skani_pairwise_matrix_pyskani(reference_genome_path, assemblies)
+
+
+def find_representative_genome(ani_matrix, assembly_ids, downloaded_assemblies):
+    dist_nparray = 1 - np.asarray(ani_matrix) / 100.0
     dist_df = pd.DataFrame(dist_nparray.T + dist_nparray,
-                 columns=fastani_assemblies,
-                 index=fastani_assemblies)
+                 columns=assembly_ids,
+                 index=assembly_ids)
 
     model = AgglomerativeClustering(metric='precomputed', n_clusters=None, compute_full_tree=True,
                                     linkage='complete', 
@@ -168,12 +273,12 @@ def alignment_summary(downloaded_assemblies, output_directory, seq2assembly_dict
 
 def run_magnet(args):
     
+    # Input arguments. 
     input_tsv = args.classification
     input_fastq = args.fastq
     input_fastq2 = args.fastq2
     mode = args.mode
     working_directory = args.output
-
     taxid_col_idx = args.taxid_idx
     abundance_col_idx = args.abundance_idx
     min_abundance = args.min_abundance
@@ -181,7 +286,6 @@ def run_magnet(args):
     min_coverage_score = args.min_covscore
     threads = args.threads
     valid_kingdom_str = args.kingdom
-
     valid_kingdom = set()
     for i in valid_kingdom_str.split(','):
         valid_kingdom.add(int(i))
@@ -212,33 +316,39 @@ def run_magnet(args):
         # make valid_kingdom a variable?
         valid_taxids = filter_input_df(input_df, min_abundance, ncbi_taxa_db, valid_kingdom=valid_kingdom, ret_subspecies=call_subspecies)
 
+    # Get reference genomes
     reference_metadata = prepare_reference_genomes(valid_taxids, working_directory, ncbi_taxa_db, accession_flag=accession_flag, mag_flag=mag_flag)
     downloaded_assemblies = reference_metadata[reference_metadata['Downloaded']]
-
     reference_genome_path = os.path.join(working_directory, 'reference_genomes')
 
-    fastani_path = os.path.join(working_directory, 'fastANI')
-    if not os.path.exists(fastani_path):
-        os.mkdir(fastani_path)
+    # Make skani path if it doesn't exist. 
+    skani_path = os.path.join(working_directory, 'skani')
+    if not os.path.exists(skani_path):
+        os.mkdir(skani_path)
 
-    fastani_assemblies = downloaded_assemblies['Assembly Accession ID'].values
-    assemblie_list_f = os.path.join(fastani_path, f"assemblie_list.txt")
-    with open(assemblie_list_f, "w") as rl_f:
-        for accession in fastani_assemblies:
-            reference_genome = os.path.join(reference_genome_path, f'{accession}.fasta')
-            rl_f.write(f"{reference_genome}\n")
+    assemblies = downloaded_assemblies['Assembly Accession ID'].values
+    mag_mode = args.include_mag
+    # If mag mode need to run skani with a custom flag not supported through the PyWheel package
+    # because a fragmented mag could have its ANI surpressed against its own species
+    with open(os.path.join(skani_path, "skani.log"), "w") as log_f:
+        if mag_mode:
+            log_f.write(
+                "Computing pairwise ANI with skani CLI: triangle --full-matrix --min-af 0.\n"
+            )
+        else:
+            log_f.write("Computing pairwise ANI with skani (pyskani).\n")
+    ani_sym = compute_skani_pairwise_matrix(
+        reference_genome_path,
+        assemblies,
+        mag_mode=mag_mode,
+        threads=threads,
+        skani_workdir=skani_path,
+    )
+    with open(os.path.join(skani_path, "skani.log"), "a") as log_f:
+        log_f.write(f"Done. Matrix shape {ani_sym.shape}.\n")
 
-    subprocess.run(['fastANI',
-                    '--rl', assemblie_list_f,
-                    '--ql', assemblie_list_f,
-                    "--matrix",
-                    '--threads', str(threads),
-                    '-o', os.path.join(fastani_path, f'pairwise_ani')],
-                   check=True,
-                   stdout=open(os.path.join(fastani_path, "fastani.log"), "a"),
-                   stderr=open(os.path.join(fastani_path, "fastani.err"), "a"))
-
-    representative_genomes, member2representative = find_representative_genome(fastani_path, fastani_assemblies, downloaded_assemblies)
+    representative_genomes, member2representative = find_representative_genome(
+        ani_sym, assemblies, downloaded_assemblies)
 
     representative_labels = []
     cluster_members = []
@@ -262,8 +372,8 @@ def run_magnet(args):
         aligner_output = run_minimap2(input_fastq, reference_fasta, 'merged', working_directory, threads=threads)
     if mode == 'illumina':
         aligner_output = run_bowtie2(input_fastq, input_fastq2, reference_fasta, 'merged', working_directory, threads=threads)
-    sort_samfile('merged', aligner_output, working_directory, min_mapq=0, threads=threads)
 
+    sort_samfile('merged', aligner_output, working_directory, min_mapq=0, threads=threads)
     coverage_files = os.path.join(working_directory, "coverage_files")
     if not os.path.exists(coverage_files):
         os.mkdir(coverage_files)

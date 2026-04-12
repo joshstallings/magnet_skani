@@ -13,9 +13,10 @@ dependencies:
     - bwa
     - scikit-learn
     - numpy
-    - fastani
+    - skani
     - pip
     - pip:
       - legacy-cgi
+      - pyskani>=0.2.0
       - -e .
 
